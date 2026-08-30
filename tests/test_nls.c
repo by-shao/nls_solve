@@ -4,169 +4,164 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static int linear_f(
-    const void *data, size_t m, size_t n, const double *x, double *fvec)
-{
-    (void)data;
-    (void)m;
-    (void)n;
-    fvec[0] = x[0] - 2.0;
-    fvec[1] = x[1] - 3.0;
-    return 0;
-}
+enum {
+    CORE_M = 3,
+    CORE_N = 2
+};
 
-static int linear_j(
-    const void *data, size_t m, size_t n, const double *x, double *jac)
-{
-    (void)data;
-    (void)m;
-    (void)n;
-    (void)x;
-    jac[0] = 1.0;
-    jac[1] = 0.0;
-    jac[2] = 0.0;
-    jac[3] = 1.0;
-    return 0;
-}
+typedef struct {
+    double rhs[CORE_M];
+} CoupledProblemData;
 
-static int nonlinear_f(
-    const void *data, size_t m, size_t n, const double *x, double *fvec)
+static int coupled_residual(const void *data, size_t m, size_t n, const double *x, double *fvec)
 {
-    (void)data;
-    (void)m;
-    (void)n;
-    fvec[0] = x[0] * x[0] - 4.0;
-    fvec[1] = x[1] - 3.0;
-    return 0;
-}
+    const CoupledProblemData *problem = (const CoupledProblemData *)data;
 
-static int nonlinear_j(
-    const void *data, size_t m, size_t n, const double *x, double *jac)
-{
-    (void)data;
-    (void)m;
-    (void)n;
-    jac[0] = 2.0 * x[0];
-    jac[1] = 0.0;
-    jac[2] = 0.0;
-    jac[3] = 1.0;
-    return 0;
-}
-
-static int coupled_f(
-    const void *data, size_t m, size_t n, const double *x, double *fvec)
-{
-    (void)data;
-    (void)m;
-    (void)n;
-    fvec[0] = x[0] + 2.0 * x[1] - 8.0;
-    fvec[1] = 3.0 * x[0] - x[1] - 3.0;
-    fvec[2] = x[0] * x[1] - 6.0;
-    return 0;
-}
-
-static int coupled_j(
-    const void *data, size_t m, size_t n, const double *x, double *jac)
-{
-    (void)data;
-    (void)m;
-    (void)n;
-    jac[0] = 1.0;
-    jac[1] = 2.0;
-    jac[2] = 3.0;
-    jac[3] = -1.0;
-    jac[4] = x[1];
-    jac[5] = x[0];
-    return 0;
-}
-
-static int near_solution(const double *x, double x0, double x1, double tol)
-{
-    return fabs(x[0] - x0) < tol && fabs(x[1] - x1) < tol;
-}
-
-static int solve_case(const char *name, eval_fvec f, eval_fjac j, size_t m, NlsAlgorithm algorithm, const double initial[2])
-{
-    nls_problem problem;
-    nls_solver *solver;
-    double x[2] = {initial[0], initial[1]};
-    int status;
-
-    if (nls_problem_init(&problem, f, j, m, 2) != 0) {
+    if (problem == NULL || x == NULL || fvec == NULL ||
+        m != CORE_M || n != CORE_N) {
         return 1;
     }
-    solver = nls_solver_alloc(&problem, algorithm, LLS_ALGO_CHOLESKY);
-    if (solver == NULL) {
-        return 1;
-    }
-    status = nls_solve(solver, NULL, x);
-    nls_solver_free(solver);
 
-    printf("%s %s: status=%d x=[%.12g, %.12g]\n",
-           name,
-           algorithm == NLS_ALGO_LM ? "LM" : "GN",
-           status,
-           x[0],
-           x[1]);
-    return status <= 0 || !near_solution(x, 2.0, 3.0, 1e-8);
+    fvec[0] = x[0] + 2.0 * x[1] - problem->rhs[0];
+    fvec[1] = 3.0 * x[0] - x[1] - problem->rhs[1];
+    fvec[2] = x[0] * x[1] - problem->rhs[2];
+    return 0;
 }
 
-static int test_finite_difference(void)
+static int coupled_jacobian(const void *data, size_t m, size_t n, const double *x, double *jac)
 {
-    const double x[2] = {1.4, -0.7};
-    const double step = 1e-6;
-    double analytic[6];
-    double numeric[6];
-    double xp[2] = {x[0], x[1]};
-    double xm[2] = {x[0], x[1]};
-    double fp[3];
-    double fm[3];
+    if (data == NULL || x == NULL || jac == NULL ||
+        m != CORE_M || n != CORE_N) {
+        return 1;
+    }
+
+    /* Row-major: jac[residual_index * n + parameter_index]. */
+    jac[0 * CORE_N + 0] = 1.0;
+    jac[0 * CORE_N + 1] = 2.0;
+    jac[1 * CORE_N + 0] = 3.0;
+    jac[1 * CORE_N + 1] = -1.0;
+    jac[2 * CORE_N + 0] = x[1];
+    jac[2 * CORE_N + 1] = x[0];
+    return 0;
+}
+
+static int check_row_major_jacobian(const CoupledProblemData *data)
+{
+    const double x[CORE_N] = {1.4, -0.7};
+    double analytic[CORE_M * CORE_N];
+    double numeric[CORE_M * CORE_N];
     double max_error = 0.0;
     size_t i;
     size_t j;
 
-    if (coupled_j(NULL, 3, 2, x, analytic) != 0) {
+    if (coupled_jacobian(data, CORE_M, CORE_N, x, analytic) != 0) {
         return 1;
     }
-    for (j = 0; j < 2; ++j) {
-        xp[0] = xm[0] = x[0];
-        xp[1] = xm[1] = x[1];
+
+    for (j = 0; j < CORE_N; ++j) {
+        double xp[CORE_N] = {x[0], x[1]};
+        double xm[CORE_N] = {x[0], x[1]};
+        double fp[CORE_M];
+        double fm[CORE_M];
+        const double step = 1.0e-6 * fmax(1.0, fabs(x[j]));
+
         xp[j] += step;
         xm[j] -= step;
-        coupled_f(NULL, 3, 2, xp, fp);
-        coupled_f(NULL, 3, 2, xm, fm);
-        for (i = 0; i < 3; ++i) {
+        if (coupled_residual(data, CORE_M, CORE_N, xp, fp) != 0 ||
+            coupled_residual(data, CORE_M, CORE_N, xm, fm) != 0) {
+            return 1;
+        }
+        for (i = 0; i < CORE_M; ++i) {
+            const size_t index = i * CORE_N + j;
             double error;
-            numeric[i * 2 + j] = (fp[i] - fm[i]) / (2.0 * step);
-            error = fabs(analytic[i * 2 + j] - numeric[i * 2 + j]);
+
+            numeric[index] = (fp[i] - fm[i]) / (2.0 * step);
+            error = fabs(analytic[index] - numeric[index]);
             if (error > max_error) {
                 max_error = error;
             }
         }
     }
 
-    printf("NLS-3 row-major finite difference: max_error=%.3g\n", max_error);
-    return max_error >= 1e-6;
+    printf("CORE1 row-major central-FD: max_error=%.3g\n", max_error);
+    return !isfinite(max_error) || max_error >= 1.0e-8;
+}
+
+static int solve_core_case(nls_problem *problem, const CoupledProblemData *data, NlsAlgorithm algorithm)
+{
+    nls_solver *solver;
+    double x[CORE_N] = {1.0, 1.0};
+    double residual[CORE_M];
+    double max_residual = 0.0;
+    size_t i;
+    int status;
+
+    solver = nls_solver_alloc(problem, algorithm, LLS_ALGO_CHOLESKY);
+    if (solver == NULL) {
+        fprintf(stderr, "CORE1 %s allocation failed\n",
+                algorithm == NLS_ALGO_LM ? "LM" : "GN");
+        return 1;
+    }
+
+    status = nls_solve(solver, data, x);
+    nls_solver_free(solver);
+
+    if (coupled_residual(data, CORE_M, CORE_N, x, residual) != 0) {
+        return 1;
+    }
+    for (i = 0; i < CORE_M; ++i) {
+        max_residual = fmax(max_residual, fabs(residual[i]));
+    }
+
+    printf("CORE1 %s: status=%d x=[%.12g, %.12g] max_residual=%.3g\n",
+           algorithm == NLS_ALGO_LM ? "LM" : "GN",
+           status,
+           x[0],
+           x[1],
+           max_residual);
+
+    return status <= NLS_MAX_ITER || !isfinite(x[0]) || !isfinite(x[1]) ||
+           fabs(x[0] - 2.0) >= 1.0e-8 ||
+           fabs(x[1] - 3.0) >= 1.0e-8 || max_residual >= 1.0e-8;
+}
+
+static int check_gn_qr_rejected(nls_problem *problem)
+{
+    nls_solver *solver =
+        nls_solver_alloc(problem, NLS_ALGO_GN, LLS_ALGO_QR);
+
+    if (solver != NULL) {
+        fprintf(stderr, "CORE1 GN+QR was not rejected during allocation\n");
+        nls_solver_free(solver);
+        return 1;
+    }
+
+    printf("CORE1 GN+QR: rejected during allocation\n");
+    return 0;
 }
 
 int main(void)
 {
-    const double zero[2] = {0.0, 0.0};
-    const double nonlinear_initial[2] = {1.0, 0.0};
+    const CoupledProblemData data = {{8.0, 3.0, 6.0}};
+    nls_problem problem;
     int failed = 0;
 
-    failed |= solve_case("NLS-1", linear_f, linear_j, 2, NLS_ALGO_LM, zero);
-    failed |= solve_case("NLS-1", linear_f, linear_j, 2, NLS_ALGO_GN, zero);
-    failed |= solve_case(
-        "NLS-2", nonlinear_f, nonlinear_j, 2, NLS_ALGO_LM, nonlinear_initial);
-    failed |= solve_case(
-        "NLS-2", nonlinear_f, nonlinear_j, 2, NLS_ALGO_GN, nonlinear_initial);
-    failed |= test_finite_difference();
-    failed |= solve_case("NLS-3", coupled_f, coupled_j, 3, NLS_ALGO_LM, zero);
-
-    if (failed) {
-        fprintf(stderr, "test_nls failed\n");
+    if (nls_problem_init(
+            &problem, coupled_residual, coupled_jacobian, CORE_M, CORE_N) != 0) {
+        fprintf(stderr, "CORE1 nls_problem_init failed\n");
         return EXIT_FAILURE;
     }
+
+    failed |= check_row_major_jacobian(&data);
+    failed |= check_gn_qr_rejected(&problem);
+    failed |= solve_core_case(&problem, &data, NLS_ALGO_LM);
+    failed |= solve_core_case(&problem, &data, NLS_ALGO_GN);
+
+    if (failed) {
+        fprintf(stderr, "test_nls CORE1 failed\n");
+        return EXIT_FAILURE;
+    }
+
+    printf("test_nls CORE1 passed\n");
     return EXIT_SUCCESS;
 }

@@ -62,24 +62,12 @@ typedef struct nls_solver_s nls_solver;
 #define NLS_ERR_NUMERIC       -4
 #define NLS_ERR_LINEAR        -5
 
-int nls_problem_init(
-    nls_problem *prob,
-    eval_fvec f,
-    eval_fjac df,
-    size_t m,
-    size_t n);
+int nls_problem_init(nls_problem *prob, eval_fvec f, eval_fjac df, size_t m, size_t n);
 
-nls_solver *nls_solver_alloc(
-    nls_problem *prob,
-    NlsAlgorithm nls,
-    LlsAlgorithm lls);
+nls_solver *nls_solver_alloc(nls_problem *prob, NlsAlgorithm nls, LlsAlgorithm lls);
 
-int nls_solve(
-    nls_solver *solver,
-    const void *data,
-    double *params);
+int nls_solve(nls_solver *solver, const void *data, double *params);
 
-void nls_solver_free(
-    nls_solver *solver);
+void nls_solver_free(nls_solver *solver);
 
 #endif

@@ -51,11 +51,15 @@ target_link_libraries(test_nls PRIVATE nls_solve)
 add_executable(test_auglag tests/test_auglag.c)
 target_link_libraries(test_auglag PRIVATE nls_solve)
 
+add_executable(test_double_gaussian tests/test_double_gaussian.c)
+target_link_libraries(test_double_gaussian PRIVATE nls_solve)
+
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(test_nls PRIVATE -Wall -Wextra)
     target_compile_options(test_auglag PRIVATE -Wall -Wextra)
+    target_compile_options(test_double_gaussian PRIVATE -Wall -Wextra)
 endif()
 
 enable_testing()
-add_test(NAME nls COMMAND test_nls)
-add_test(NAME auglag COMMAND test_auglag)
+add_test(NAME nls_core COMMAND test_nls)
+add_test(NAME auglag_core_api COMMAND test_auglag)

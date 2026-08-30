@@ -41,15 +41,7 @@ static int finite_array(const double *values, size_t count)
     return 1;
 }
 
-static int lmder_adapter(
-    void *p,
-    int m,
-    int n,
-    const double *x,
-    double *fvec,
-    double *fjac,
-    int ldfjac,
-    int iflag)
+static int lmder_adapter(void *p, int m, int n, const double *x, double *fvec, double *fjac, int ldfjac, int iflag)
 {
     LmAdapterData *adapter = (LmAdapterData *)p;
     size_t i;
@@ -150,12 +142,7 @@ static int validate_problem_for_solve(const nls_problem *problem)
     return 1;
 }
 
-int nls_problem_init(
-    nls_problem *prob,
-    eval_fvec f,
-    eval_fjac df,
-    size_t m,
-    size_t n)
+int nls_problem_init(nls_problem *prob, eval_fvec f, eval_fjac df, size_t m, size_t n)
 {
     if (prob == NULL || f == NULL || df == NULL || m == 0 || n == 0) {
         return NLS_ERR_INVALID;
@@ -176,16 +163,14 @@ int nls_problem_init(
     return 0;
 }
 
-nls_solver *nls_solver_alloc(
-    nls_problem *prob,
-    NlsAlgorithm nls,
-    LlsAlgorithm lls)
+nls_solver *nls_solver_alloc(nls_problem *prob, NlsAlgorithm nls, LlsAlgorithm lls)
 {
     nls_solver *solver;
     size_t mn;
 
     if (!validate_problem_for_solve(prob) || nls < 0 || nls >= NLS_ALGO_MAX ||
         lls < 0 || lls >= LLS_ALGO_MAX ||
+        (nls == NLS_ALGO_GN && lls != LLS_ALGO_CHOLESKY) ||
         (nls == NLS_ALGO_LM && prob->m < prob->n) ||
         !size_product_ok(prob->m, prob->n) ||
         !size_product_ok(prob->n, prob->n)) {
@@ -306,14 +291,19 @@ static int solve_lm(nls_solver *solver, const void *data, double *params)
         solver->wa3,
         solver->wa4);
 
+    solver->last_nfev = nfev > 0 ? (size_t)nfev : 0;
+    solver->last_njev = njev > 0 ? (size_t)njev : 0;
+
     return map_lmder_info(info, adapter.failure_status);
 }
 
-int nls_solve(
-    nls_solver *solver,
-    const void *data,
-    double *params)
+int nls_solve(nls_solver *solver, const void *data, double *params)
 {
+    if (solver != NULL) {
+        solver->last_iterations = 0;
+        solver->last_nfev = 0;
+        solver->last_njev = 0;
+    }
     if (solver == NULL || params == NULL ||
         !validate_problem_for_solve(&solver->problem) ||
         !finite_array(params, solver->problem.n)) {
@@ -332,8 +322,21 @@ int nls_solve(
     return NLS_ERR_INVALID;
 }
 
-void nls_solver_free(
-    nls_solver *solver)
+void nls_solver_get_stats(const nls_solver *solver, nls_solver_stats *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+    memset(stats, 0, sizeof(*stats));
+    if (solver == NULL) {
+        return;
+    }
+    stats->iterations = solver->last_iterations;
+    stats->nfev = solver->last_nfev;
+    stats->njev = solver->last_njev;
+}
+
+void nls_solver_free(nls_solver *solver)
 {
     if (solver == NULL) {
         return;

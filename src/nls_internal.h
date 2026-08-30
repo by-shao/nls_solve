@@ -23,8 +23,20 @@ struct nls_solver_s {
     double *jtj;
     double *jtf;
     double *step;
+
+    size_t last_iterations;
+    size_t last_nfev;
+    size_t last_njev;
 };
 
+typedef struct {
+    size_t iterations;
+    size_t nfev;
+    size_t njev;
+} nls_solver_stats;
+
 int nls_gn_solve(nls_solver *solver, const void *data, double *params);
+
+void nls_solver_get_stats(const nls_solver *solver, nls_solver_stats *stats);
 
 #endif

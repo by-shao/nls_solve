@@ -48,11 +48,7 @@ static int finite_array(const double *values, size_t n)
     return 1;
 }
 
-static void form_jtj(
-    const double *jac,
-    size_t m,
-    size_t n,
-    double *jtj)
+static void form_jtj(const double *jac, size_t m, size_t n, double *jtj)
 {
     size_t i;
     size_t j;
@@ -69,12 +65,7 @@ static void form_jtj(
     }
 }
 
-static void form_jtf(
-    const double *jac,
-    const double *fvec,
-    size_t m,
-    size_t n,
-    double *jtf)
+static void form_jtf(const double *jac, const double *fvec, size_t m, size_t n, double *jtf)
 {
     size_t i;
     size_t j;
@@ -130,19 +121,22 @@ static int cholesky_solve(double *a, const double *rhs, size_t n, double *x)
     return 0;
 }
 
-static int evaluate_problem(
-    const nls_problem *problem,
-    const void *data,
-    const double *params,
-    double *fvec,
-    double *jac)
+static int evaluate_problem(nls_solver *solver, const void *data, const double *params, double *fvec, double *jac)
 {
-    if (problem->f(data, problem->m, problem->n, params, fvec) != 0 ||
-        problem->df(data, problem->m, problem->n, params, jac) != 0) {
+    const nls_problem *problem = &solver->problem;
+
+    ++solver->last_nfev;
+    if (problem->f(data, problem->m, problem->n, params, fvec) != 0) {
         return NLS_ERR_CALLBACK;
     }
-    if (!finite_array(fvec, problem->m) ||
-        !finite_array(jac, problem->m * problem->n)) {
+    if (!finite_array(fvec, problem->m)) {
+        return NLS_ERR_NUMERIC;
+    }
+    ++solver->last_njev;
+    if (problem->df(data, problem->m, problem->n, params, jac) != 0) {
+        return NLS_ERR_CALLBACK;
+    }
+    if (!finite_array(jac, problem->m * problem->n)) {
         return NLS_ERR_NUMERIC;
     }
     return 0;
@@ -157,7 +151,7 @@ int nls_gn_solve(nls_solver *solver, const void *data, double *params)
     int status;
 
     status = evaluate_problem(
-        problem, data, params, solver->fvec, solver->jac_row);
+        solver, data, params, solver->fvec, solver->jac_row);
     if (status != 0) {
         return status;
     }
@@ -219,10 +213,11 @@ int nls_gn_solve(nls_solver *solver, const void *data, double *params)
         }
 
         status = evaluate_problem(
-            problem, data, params, solver->fvec, solver->jac_row);
+            solver, data, params, solver->fvec, solver->jac_row);
         if (status != 0) {
             return status;
         }
+        ++solver->last_iterations;
         new_cost = 0.5 * vec_dot(solver->fvec, solver->fvec, problem->m);
         if (!isfinite(new_cost)) {
             return NLS_ERR_NUMERIC;
