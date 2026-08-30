@@ -1,43 +1,54 @@
 #include "auglag_constrain.h"
 
 #include <float.h>
-#include <inttypes.h>
 #include <math.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define DG_PARAMETER_COUNT 7
-#define INPUT_MAGIC "NLS_DG_INPUT_V1"
+#define DG_CONSTRAINT_TOL 1.0e-8
+#define DG_JACOBIAN_REL_TOL 1.0e-5
+#define DG_ACTIVE_BOUND_TOL 2.0e-6
+
+typedef struct {
+    const char *name;
+    const char *title;
+    size_t nx;
+    size_t ny;
+    double h_min;
+    double h_max;
+    double v_min;
+    double v_max;
+    double truth[DG_PARAMETER_COUNT];
+    double initial[DG_PARAMETER_COUNT];
+    double lower[DG_PARAMETER_COUNT];
+    size_t mask_every;
+    double noise_scale;
+    double reference_params[DG_PARAMETER_COUNT];
+    double reference_sse;
+    double reference_rmse;
+    double reference_max_h;
+    double reference_max_v;
+    size_t reference_nit;
+    size_t reference_nfev;
+    double prediction_rel_tol;
+    double max_point_tol;
+} DoubleGaussianCase;
+
+#include "double_gaussian_reference.h"
 
 typedef struct {
     size_t m;
-    const double *h;
-    const double *v;
-    const double *observed;
+    double *h;
+    double *v;
+    double *observed;
 } DoubleGaussianData;
 
 typedef struct {
     size_t parameter_index;
     double lower;
 } LowerBound;
-
-typedef struct {
-    char name[32];
-    size_t grid_nx;
-    size_t grid_ny;
-    size_t full_count;
-    size_t mask_count;
-    size_t m;
-    size_t *original_index;
-    double *h;
-    double *v;
-    double *observed;
-    double truth[DG_PARAMETER_COUNT];
-    double initial[DG_PARAMETER_COUNT];
-    double lower[DG_PARAMETER_COUNT];
-} DoubleGaussianCase;
 
 typedef struct {
     int status;
@@ -47,12 +58,19 @@ typedef struct {
     double violation;
     double max_h;
     double max_v;
-    int finite;
     double rho;
+    double prediction_cross_rmse;
+    double relative_prediction_cross_rmse;
+    double max_point_error;
+    double sse_difference;
+    double rmse_difference;
+    double relative_rmse_difference;
+    double parameter_max_abs_difference;
     size_t outer_iterations;
     size_t inner_iterations;
     size_t inner_nfev;
     size_t inner_njev;
+    int finite;
 } DoubleGaussianResult;
 
 static int finite_array(const double *values, size_t count)
@@ -174,161 +192,77 @@ static int lower_bound_jac(const double *x, double *jac, void *data)
     return 0;
 }
 
-static void free_case(DoubleGaussianCase *test_case)
+static void free_case_data(DoubleGaussianData *data)
 {
-    if (test_case == NULL) {
+    if (data == NULL) {
         return;
     }
-    free(test_case->original_index);
-    free(test_case->h);
-    free(test_case->v);
-    free(test_case->observed);
-    memset(test_case, 0, sizeof(*test_case));
+    free(data->h);
+    free(data->v);
+    free(data->observed);
+    memset(data, 0, sizeof(*data));
 }
 
-static int expect_token(FILE *input, const char *expected)
+static int generate_case_data(const DoubleGaussianCase *test_case, DoubleGaussianData *data)
 {
-    char token[64];
+    const size_t full_count = test_case->nx * test_case->ny;
+    size_t full_index;
+    size_t output_index = 0;
 
-    return fscanf(input, "%63s", token) == 1 &&
-        strcmp(token, expected) == 0;
-}
-
-static int read_vector(FILE *input, double *values, size_t count)
-{
-    size_t i;
-
-    for (i = 0; i < count; ++i) {
-        if (fscanf(input, "%lf", &values[i]) != 1) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int read_case(const char *path, DoubleGaussianCase *test_case)
-{
-    char magic[64];
-    FILE *input = fopen(path, "r");
-    size_t i;
-    int ok = 0;
-
-    if (input == NULL || test_case == NULL) {
-        if (input != NULL) {
-            fclose(input);
-        }
+    memset(data, 0, sizeof(*data));
+    if (test_case->nx < 2 || test_case->ny < 2 || full_count == 0) {
         return 0;
     }
-    memset(test_case, 0, sizeof(*test_case));
-    if (fscanf(input, "%63s", magic) != 1 || strcmp(magic, INPUT_MAGIC) != 0 ||
-        !expect_token(input, "name") ||
-        fscanf(input, "%31s", test_case->name) != 1 ||
-        !expect_token(input, "grid_nx") ||
-        fscanf(input, "%zu", &test_case->grid_nx) != 1 ||
-        !expect_token(input, "grid_ny") ||
-        fscanf(input, "%zu", &test_case->grid_ny) != 1 ||
-        !expect_token(input, "full_count") ||
-        fscanf(input, "%zu", &test_case->full_count) != 1 ||
-        !expect_token(input, "mask_count") ||
-        fscanf(input, "%zu", &test_case->mask_count) != 1 ||
-        !expect_token(input, "m") || fscanf(input, "%zu", &test_case->m) != 1 ||
-        !expect_token(input, "truth") ||
-        !read_vector(input, test_case->truth, DG_PARAMETER_COUNT) ||
-        !expect_token(input, "initial") ||
-        !read_vector(input, test_case->initial, DG_PARAMETER_COUNT) ||
-        !expect_token(input, "lower") ||
-        !read_vector(input, test_case->lower, DG_PARAMETER_COUNT) ||
-        !expect_token(input, "data") || test_case->m == 0 ||
-        test_case->mask_count + test_case->m != test_case->full_count) {
-        goto done;
-    }
-
-    test_case->original_index =
-        (size_t *)calloc(test_case->m, sizeof(*test_case->original_index));
-    test_case->h = (double *)calloc(test_case->m, sizeof(*test_case->h));
-    test_case->v = (double *)calloc(test_case->m, sizeof(*test_case->v));
-    test_case->observed =
-        (double *)calloc(test_case->m, sizeof(*test_case->observed));
-    if (test_case->original_index == NULL || test_case->h == NULL ||
-        test_case->v == NULL || test_case->observed == NULL) {
-        goto done;
-    }
-    for (i = 0; i < test_case->m; ++i) {
-        if (fscanf(
-                input,
-                "%zu %lf %lf %lf",
-                &test_case->original_index[i],
-                &test_case->h[i],
-                &test_case->v[i],
-                &test_case->observed[i]) != 4 ||
-            test_case->original_index[i] >= test_case->full_count ||
-            !isfinite(test_case->h[i]) || !isfinite(test_case->v[i]) ||
-            !isfinite(test_case->observed[i])) {
-            goto done;
+    for (full_index = 0; full_index < full_count; ++full_index) {
+        if (test_case->mask_every == 0 ||
+            full_index % test_case->mask_every != 0) {
+            ++data->m;
         }
     }
-    ok = 1;
-
-done:
-    fclose(input);
-    if (!ok) {
-        free_case(test_case);
+    data->h = (double *)calloc(data->m, sizeof(*data->h));
+    data->v = (double *)calloc(data->m, sizeof(*data->v));
+    data->observed = (double *)calloc(data->m, sizeof(*data->observed));
+    if (data->m == 0 || data->h == NULL || data->v == NULL ||
+        data->observed == NULL) {
+        free_case_data(data);
+        return 0;
     }
-    return ok;
+    for (full_index = 0; full_index < full_count; ++full_index) {
+        const size_t ix = full_index % test_case->nx;
+        const size_t iy = full_index / test_case->nx;
+        const double h = test_case->h_min + (double)ix *
+            (test_case->h_max - test_case->h_min) /
+            (double)(test_case->nx - 1);
+        const double v = test_case->v_min + (double)iy *
+            (test_case->v_max - test_case->v_min) /
+            (double)(test_case->ny - 1);
+        double observed;
+
+        if (test_case->mask_every != 0 &&
+            full_index % test_case->mask_every == 0) {
+            continue;
+        }
+        if (double_gaussian_model(test_case->truth, h, v, &observed) != 0) {
+            free_case_data(data);
+            return 0;
+        }
+        observed += test_case->noise_scale *
+            (0.01 * sin(0.37 * (double)full_index) +
+             0.005 * cos(0.11 * (double)full_index));
+        data->h[output_index] = h;
+        data->v[output_index] = v;
+        data->observed[output_index] = observed;
+        ++output_index;
+    }
+    return output_index == data->m && finite_array(data->observed, data->m);
 }
 
-static uint64_t hash_u64(uint64_t hash, uint64_t value)
+static int jacobian_check(const DoubleGaussianCase *test_case, const DoubleGaussianData *data, double *max_error, double *relative_error)
 {
-    hash ^= value;
-    return hash * UINT64_C(1099511628211);
-}
-
-static uint64_t hash_double(uint64_t hash, double value)
-{
-    uint64_t bits;
-
-    memcpy(&bits, &value, sizeof(bits));
-    return hash_u64(hash, bits);
-}
-
-static uint64_t input_hash(const DoubleGaussianCase *test_case)
-{
-    uint64_t hash = UINT64_C(1469598103934665603);
-    size_t i;
-
-    hash = hash_u64(hash, 1);
-    hash = hash_u64(hash, (uint64_t)test_case->grid_nx);
-    hash = hash_u64(hash, (uint64_t)test_case->grid_ny);
-    hash = hash_u64(hash, (uint64_t)test_case->full_count);
-    hash = hash_u64(hash, (uint64_t)test_case->mask_count);
-    hash = hash_u64(hash, (uint64_t)test_case->m);
-    for (i = 0; i < DG_PARAMETER_COUNT; ++i) {
-        hash = hash_double(hash, test_case->truth[i]);
-    }
-    for (i = 0; i < DG_PARAMETER_COUNT; ++i) {
-        hash = hash_double(hash, test_case->initial[i]);
-    }
-    for (i = 0; i < DG_PARAMETER_COUNT; ++i) {
-        hash = hash_double(hash, test_case->lower[i]);
-    }
-    for (i = 0; i < test_case->m; ++i) {
-        hash = hash_u64(hash, (uint64_t)test_case->original_index[i]);
-        hash = hash_double(hash, test_case->h[i]);
-        hash = hash_double(hash, test_case->v[i]);
-        hash = hash_double(hash, test_case->observed[i]);
-    }
-    return hash;
-}
-
-static int jacobian_check(const DoubleGaussianCase *test_case, double *max_error, double *relative_error)
-{
-    DoubleGaussianData data = {
-        test_case->m, test_case->h, test_case->v, test_case->observed
-    };
-    const size_t mn = test_case->m * DG_PARAMETER_COUNT;
+    const size_t mn = data->m * DG_PARAMETER_COUNT;
     double *analytic = (double *)calloc(mn, sizeof(*analytic));
-    double *plus = (double *)calloc(test_case->m, sizeof(*plus));
-    double *minus = (double *)calloc(test_case->m, sizeof(*minus));
+    double *plus = (double *)calloc(data->m, sizeof(*plus));
+    double *minus = (double *)calloc(data->m, sizeof(*minus));
     double xp[DG_PARAMETER_COUNT];
     double xm[DG_PARAMETER_COUNT];
     size_t i;
@@ -338,14 +272,8 @@ static int jacobian_check(const DoubleGaussianCase *test_case, double *max_error
     if (analytic == NULL || plus == NULL || minus == NULL) {
         goto done;
     }
-    memcpy(xp, test_case->initial, sizeof(xp));
-    memcpy(xm, test_case->initial, sizeof(xm));
     if (double_gaussian_jacobian(
-            &data,
-            test_case->m,
-            DG_PARAMETER_COUNT,
-            test_case->initial,
-            analytic) != 0) {
+            data, data->m, DG_PARAMETER_COUNT, test_case->initial, analytic) != 0) {
         goto done;
     }
     *max_error = 0.0;
@@ -362,12 +290,12 @@ static int jacobian_check(const DoubleGaussianCase *test_case, double *max_error
         xp[j] += step;
         xm[j] -= step;
         if (double_gaussian_residual(
-                &data, test_case->m, DG_PARAMETER_COUNT, xp, plus) != 0 ||
+                data, data->m, DG_PARAMETER_COUNT, xp, plus) != 0 ||
             double_gaussian_residual(
-                &data, test_case->m, DG_PARAMETER_COUNT, xm, minus) != 0) {
+                data, data->m, DG_PARAMETER_COUNT, xm, minus) != 0) {
             goto done;
         }
-        for (i = 0; i < test_case->m; ++i) {
+        for (i = 0; i < data->m; ++i) {
             const double numeric = (plus[i] - minus[i]) / (2.0 * step);
             const double expected = analytic[i * DG_PARAMETER_COUNT + j];
             const double error = fabs(expected - numeric);
@@ -408,52 +336,74 @@ static double constraint_violation(const DoubleGaussianCase *test_case, const do
     return fmax(0.0, violation);
 }
 
-static int evaluate_result(const DoubleGaussianCase *test_case, DoubleGaussianResult *result)
+static int evaluate_result(const DoubleGaussianCase *test_case, const DoubleGaussianData *data, DoubleGaussianResult *result)
 {
-    DoubleGaussianData data = {
-        test_case->m, test_case->h, test_case->v, test_case->observed
-    };
-    double *residual = (double *)calloc(test_case->m, sizeof(*residual));
+    double prediction_difference_sum = 0.0;
+    double signal_scale = 0.0;
     size_t i;
 
-    if (residual == NULL ||
-        double_gaussian_residual(
-            &data,
-            test_case->m,
-            DG_PARAMETER_COUNT,
-            result->params,
-            residual) != 0) {
-        free(residual);
-        return 0;
-    }
     result->sse = 0.0;
-    for (i = 0; i < test_case->m; ++i) {
-        result->sse += residual[i] * residual[i];
+    result->parameter_max_abs_difference = 0.0;
+    for (i = 0; i < data->m; ++i) {
+        double prediction;
+        double reference_prediction;
+        double residual;
+        double prediction_difference;
+
+        if (double_gaussian_model(
+                result->params, data->h[i], data->v[i], &prediction) != 0 ||
+            double_gaussian_model(
+                test_case->reference_params,
+                data->h[i],
+                data->v[i],
+                &reference_prediction) != 0) {
+            return 0;
+        }
+        residual = prediction - data->observed[i];
+        prediction_difference = prediction - reference_prediction;
+        result->sse += residual * residual;
+        prediction_difference_sum += prediction_difference * prediction_difference;
+        signal_scale = fmax(signal_scale, fabs(data->observed[i]));
     }
-    result->rmse = sqrt(result->sse / (double)test_case->m);
+    for (i = 0; i < DG_PARAMETER_COUNT; ++i) {
+        result->parameter_max_abs_difference = fmax(
+            result->parameter_max_abs_difference,
+            fabs(result->params[i] - test_case->reference_params[i]));
+    }
+    result->rmse = sqrt(result->sse / (double)data->m);
     result->violation = constraint_violation(test_case, result->params);
     result->max_h = -(result->params[5] + result->params[6]) /
         (2.0 * result->params[3]);
     result->max_v = -(result->params[5] - result->params[6]) /
         (2.0 * result->params[4]);
+    result->prediction_cross_rmse = sqrt(
+        prediction_difference_sum / (double)data->m);
+    result->relative_prediction_cross_rmse =
+        result->prediction_cross_rmse / fmax(signal_scale, DBL_MIN);
+    result->max_point_error = hypot(
+        result->max_h - test_case->reference_max_h,
+        result->max_v - test_case->reference_max_v);
+    result->sse_difference = result->sse - test_case->reference_sse;
+    result->rmse_difference = result->rmse - test_case->reference_rmse;
+    result->relative_rmse_difference =
+        fabs(result->rmse_difference) / fmax(signal_scale, DBL_MIN);
     result->finite = finite_array(result->params, DG_PARAMETER_COUNT) &&
         isfinite(result->sse) && isfinite(result->rmse) &&
         isfinite(result->violation) && isfinite(result->max_h) &&
-        isfinite(result->max_v) && isfinite(result->rho);
-    free(residual);
+        isfinite(result->max_v) && isfinite(result->rho) &&
+        isfinite(result->relative_prediction_cross_rmse) &&
+        isfinite(result->max_point_error) &&
+        isfinite(result->relative_rmse_difference);
     return result->finite;
 }
 
-static void solve_case(const DoubleGaussianCase *test_case, NlsAlgorithm algorithm, DoubleGaussianResult *result)
+static void solve_case(const DoubleGaussianCase *test_case, const DoubleGaussianData *data, NlsAlgorithm algorithm, DoubleGaussianResult *result)
 {
-    DoubleGaussianData data = {
-        test_case->m, test_case->h, test_case->v, test_case->observed
-    };
     AugLagProblem problem = {
         double_gaussian_residual,
         double_gaussian_jacobian,
-        &data,
-        test_case->m,
+        (void *)data,
+        data->m,
         DG_PARAMETER_COUNT
     };
     LowerBound bound_data[4];
@@ -465,6 +415,7 @@ static void solve_case(const DoubleGaussianCase *test_case, NlsAlgorithm algorit
     size_t i;
 
     memset(result, 0, sizeof(*result));
+    result->rho = NAN;
     memcpy(result->params, test_case->initial, sizeof(result->params));
     for (i = 1; i <= 4; ++i) {
         if (isfinite(test_case->lower[i])) {
@@ -481,8 +432,7 @@ static void solve_case(const DoubleGaussianCase *test_case, NlsAlgorithm algorit
     constraints.nineq = bound_count;
     auglag_options_init(&options);
     options.max_outer_iter = 50;
-    options.constraint_tol = 1.0e-8;
-
+    options.constraint_tol = DG_CONSTRAINT_TOL;
     result->status = auglag_init(
         &context,
         &problem,
@@ -492,7 +442,6 @@ static void solve_case(const DoubleGaussianCase *test_case, NlsAlgorithm algorit
         algorithm,
         algorithm == NLS_ALGO_LM ? LLS_ALGO_QR : LLS_ALGO_CHOLESKY);
     if (result->status != 0) {
-        result->finite = finite_array(result->params, DG_PARAMETER_COUNT);
         return;
     }
     result->status = auglag_solve(&context, result->params);
@@ -501,8 +450,21 @@ static void solve_case(const DoubleGaussianCase *test_case, NlsAlgorithm algorit
     result->inner_iterations = context.inner_iterations;
     result->inner_nfev = context.inner_function_evaluations;
     result->inner_njev = context.inner_jacobian_evaluations;
-    (void)evaluate_result(test_case, result);
+    (void)evaluate_result(test_case, data, result);
     auglag_destroy(&context);
+}
+
+static int result_passes(const DoubleGaussianCase *test_case, const DoubleGaussianResult *result)
+{
+    const int active_bound_ok = strcmp(test_case->name, "DG5") != 0 ||
+        fabs(result->params[3] - test_case->lower[3]) <= DG_ACTIVE_BOUND_TOL;
+
+    return result->status == AUGLAG_SUCCESS && result->finite &&
+        result->violation <= DG_CONSTRAINT_TOL &&
+        result->relative_prediction_cross_rmse <= test_case->prediction_rel_tol &&
+        result->relative_rmse_difference <= test_case->prediction_rel_tol &&
+        result->max_point_error <= test_case->max_point_tol &&
+        active_bound_ok;
 }
 
 static void print_vector(const double *values, size_t count)
@@ -516,68 +478,97 @@ static void print_vector(const double *values, size_t count)
     putchar(']');
 }
 
-static void print_result(const DoubleGaussianCase *test_case, const char *algorithm, uint64_t hash, double jac_error, double jac_relative_error, const DoubleGaussianResult *result)
+static void print_result(const char *algorithm, const DoubleGaussianResult *result, int pass)
 {
-    printf("C_RESULT_BEGIN\n");
-    printf("case=%s\n", test_case->name);
-    printf("algorithm=%s\n", algorithm);
-    printf("input_hash=%016" PRIx64 "\n", hash);
-    printf("status=%d\n", result->status);
-    printf("final=");
+    printf(
+        "  %-3s : status=%d finite=%s sse=%.17g rmse=%.17g "
+        "rel_pred=%.6g max_err=%.6g violation=%.6g %s\n",
+        algorithm,
+        result->status,
+        result->finite ? "true" : "false",
+        result->sse,
+        result->rmse,
+        result->relative_prediction_cross_rmse,
+        result->max_point_error,
+        result->violation,
+        pass ? "PASS" : "FAIL");
+    printf(
+        "        sse_diff=%.6g rmse_diff=%.6g rel_rmse_diff=%.6g "
+        "rho=%.6g outer=%zu inner=%zu nfev=%zu njev=%zu\n",
+        result->sse_difference,
+        result->rmse_difference,
+        result->relative_rmse_difference,
+        result->rho,
+        result->outer_iterations,
+        result->inner_iterations,
+        result->inner_nfev,
+        result->inner_njev);
+    printf("        params=");
     print_vector(result->params, DG_PARAMETER_COUNT);
-    printf("\n");
-    printf("sse=%.17g\n", result->sse);
-    printf("rmse=%.17g\n", result->rmse);
-    printf("constraint_violation=%.17g\n", result->violation);
-    printf("finite_check=%s\n", result->finite ? "PASS" : "FAIL");
-    printf("max_point=[%.17g,%.17g]\n", result->max_h, result->max_v);
-    printf("rho_final=%.17g\n", result->rho);
-    printf("outer_iterations=%zu\n", result->outer_iterations);
-    printf("inner_iterations=%zu\n", result->inner_iterations);
-    printf("inner_nfev=%zu\n", result->inner_nfev);
-    printf("inner_njev=%zu\n", result->inner_njev);
-    printf("jac_error=%.17g\n", jac_error);
-    printf("jac_relative_error=%.17g\n", jac_relative_error);
-    printf("C_RESULT_END\n");
+    printf(" param_max_abs_diff=%.6g\n", result->parameter_max_abs_difference);
 }
 
-int main(int argc, char **argv)
+int main(void)
 {
-    DoubleGaussianCase test_case;
-    DoubleGaussianResult lm_result;
-    DoubleGaussianResult gn_result;
-    uint64_t hash;
-    double jac_error = NAN;
-    double jac_relative_error = NAN;
+    int lm_pass[DOUBLE_GAUSSIAN_CASE_COUNT] = {0};
+    int gn_pass[DOUBLE_GAUSSIAN_CASE_COUNT] = {0};
+    int overall = 1;
+    size_t case_index;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s INPUT_FILE\n", argv[0]);
-        return EXIT_FAILURE;
+    for (case_index = 0; case_index < DOUBLE_GAUSSIAN_CASE_COUNT; ++case_index) {
+        const DoubleGaussianCase *test_case =
+            &g_double_gaussian_cases[case_index];
+        DoubleGaussianData data;
+        DoubleGaussianResult lm_result;
+        DoubleGaussianResult gn_result;
+        double jac_max_error = NAN;
+        double jac_relative_error = NAN;
+        int jac_pass;
+
+        printf("%s %s\n", test_case->name, test_case->title);
+        printf("  REF : params=");
+        print_vector(test_case->reference_params, DG_PARAMETER_COUNT);
+        printf(
+            " sse=%.17g rmse=%.17g max=[%.17g,%.17g] nit=%zu nfev=%zu\n",
+            test_case->reference_sse,
+            test_case->reference_rmse,
+            test_case->reference_max_h,
+            test_case->reference_max_v,
+            test_case->reference_nit,
+            test_case->reference_nfev);
+        if (!generate_case_data(test_case, &data)) {
+            printf("  DATA: generation failed\n\n");
+            overall = 0;
+            continue;
+        }
+        jac_pass = jacobian_check(
+            test_case, &data, &jac_max_error, &jac_relative_error) &&
+            jac_relative_error <= DG_JACOBIAN_REL_TOL;
+        printf(
+            "  JAC : max_abs=%.6g relative=%.6g limit=%.6g %s\n",
+            jac_max_error,
+            jac_relative_error,
+            DG_JACOBIAN_REL_TOL,
+            jac_pass ? "PASS" : "FAIL");
+        solve_case(test_case, &data, NLS_ALGO_LM, &lm_result);
+        solve_case(test_case, &data, NLS_ALGO_GN, &gn_result);
+        lm_pass[case_index] = jac_pass && result_passes(test_case, &lm_result);
+        gn_pass[case_index] = jac_pass && result_passes(test_case, &gn_result);
+        print_result("LM", &lm_result, lm_pass[case_index]);
+        print_result("GN", &gn_result, gn_pass[case_index]);
+        putchar('\n');
+        overall = overall && lm_pass[case_index] && gn_pass[case_index];
+        free_case_data(&data);
     }
-    if (!read_case(argv[1], &test_case)) {
-        fprintf(stderr, "invalid Double Gaussian input: %s\n", argv[1]);
-        return EXIT_FAILURE;
+
+    printf("Double Gaussian Summary:\n");
+    for (case_index = 0; case_index < DOUBLE_GAUSSIAN_CASE_COUNT; ++case_index) {
+        printf(
+            "  %s: LM %s, GN %s\n",
+            g_double_gaussian_cases[case_index].name,
+            lm_pass[case_index] ? "PASS" : "FAIL",
+            gn_pass[case_index] ? "PASS" : "FAIL");
     }
-    hash = input_hash(&test_case);
-    if (!jacobian_check(&test_case, &jac_error, &jac_relative_error)) {
-        fprintf(stderr, "Double Gaussian Jacobian check could not run\n");
-    }
-    solve_case(&test_case, NLS_ALGO_LM, &lm_result);
-    solve_case(&test_case, NLS_ALGO_GN, &gn_result);
-    print_result(
-        &test_case,
-        "LM",
-        hash,
-        jac_error,
-        jac_relative_error,
-        &lm_result);
-    print_result(
-        &test_case,
-        "GN",
-        hash,
-        jac_error,
-        jac_relative_error,
-        &gn_result);
-    free_case(&test_case);
-    return EXIT_SUCCESS;
+    printf("  Overall: %s\n", overall ? "PASS" : "FAIL");
+    return overall ? EXIT_SUCCESS : EXIT_FAILURE;
 }
